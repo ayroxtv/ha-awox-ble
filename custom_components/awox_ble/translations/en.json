@@ -1,0 +1,49 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "bluetooth_confirm": {
+        "title": "AwoX / EGLO light found",
+        "description": "Set up the mesh of {name} ({mac})?"
+      },
+      "user": {
+        "title": "AwoX / EGLO connect mesh",
+        "description": "The mesh credentials can be fetched once from your AwoX account, or typed in. After setup everything runs locally over Bluetooth.",
+        "menu_options": {
+          "cloud": "Log in to my AwoX account (once)",
+          "manual": "Enter the mesh credentials manually"
+        }
+      },
+      "cloud": {
+        "title": "AwoX account",
+        "description": "Used once to read the mesh name, password and device list. Your account password is not stored.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "manual": {
+        "title": "Mesh credentials",
+        "description": "Home Assistant connects to the light with this MAC address and lists every node that answers.",
+        "data": {
+          "mesh_name": "Mesh name",
+          "mesh_password": "Mesh password",
+          "mesh_key": "Long term key (optional)",
+          "mac": "MAC address of one light"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid credentials",
+      "cannot_connect": "Connection failed (see the logs)",
+      "device_not_found": "No connectable Bluetooth device with this MAC address is in range of an adapter or proxy",
+      "no_status": "Logged in, but no light answered the status request",
+      "invalid_mac": "Invalid MAC address",
+      "max_length_16": "16 characters maximum"
+    },
+    "abort": {
+      "already_configured": "This mesh is already configured",
+      "no_devices_found": "No AwoX mesh device in this account"
+    }
+  }
+}

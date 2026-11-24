@@ -1,0 +1,53 @@
+[project]
+name = "awox-ble"
+version = "0.1.0"
+description = "Home Assistant integration for AwoX / EGLO connect Telink mesh lights over the HA Bluetooth stack"
+requires-python = ">=3.13"
+license = "MIT"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = ["tests/protocol/legacy"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "S", "SIM", "RUF", "PL", "TRY", "LOG", "G", "PTH", "C4", "RET"]
+ignore = [
+    "PLR2004",  # magic values are protocol constants
+    "PLR0913",
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
+    "TRY003",
+    "TRY300",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "S105", "S106", "S311", "SLF001", "PLC0415", "ASYNC109", "ASYNC110", "PLW0108"]
+"tools/**" = ["T201", "PLC0415", "S105", "ASYNC240", "ASYNC109"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["custom_components"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+exclude = ["tests/protocol/legacy/"]
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = ["tests.protocol.legacy.*", "Crypto.*", "pytest_homeassistant_custom_component.*"]
+ignore_errors = true
+ignore_missing_imports = true
+follow_imports = "skip"

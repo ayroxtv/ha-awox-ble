@@ -1,0 +1,49 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "bluetooth_confirm": {
+        "title": "Lumière AwoX / EGLO détectée",
+        "description": "Configurer le mesh de {name} ({mac}) ?"
+      },
+      "user": {
+        "title": "Mesh AwoX / EGLO connect",
+        "description": "Les identifiants du mesh peuvent être récupérés une seule fois depuis votre compte AwoX, ou saisis à la main. Ensuite, tout fonctionne en local via Bluetooth.",
+        "menu_options": {
+          "cloud": "Me connecter à mon compte AwoX (une seule fois)",
+          "manual": "Saisir les identifiants du mesh"
+        }
+      },
+      "cloud": {
+        "title": "Compte AwoX",
+        "description": "Utilisé une seule fois pour lire le nom, le mot de passe et la liste des appareils du mesh. Le mot de passe du compte n'est pas enregistré.",
+        "data": {
+          "username": "E-mail",
+          "password": "Mot de passe"
+        }
+      },
+      "manual": {
+        "title": "Identifiants du mesh",
+        "description": "Home Assistant se connecte à la lumière qui a cette adresse MAC et liste tous les nœuds qui répondent.",
+        "data": {
+          "mesh_name": "Nom du mesh",
+          "mesh_password": "Mot de passe du mesh",
+          "mesh_key": "Clé long terme (facultatif)",
+          "mac": "Adresse MAC d'une lumière"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Identifiants refusés",
+      "cannot_connect": "Échec de connexion (voir les journaux)",
+      "device_not_found": "Aucun appareil Bluetooth connectable avec cette adresse MAC n'est à portée d'un adaptateur ou d'un proxy",
+      "no_status": "Connexion réussie, mais aucune lumière n'a répondu à la demande de statut",
+      "invalid_mac": "Adresse MAC invalide",
+      "max_length_16": "16 caractères maximum"
+    },
+    "abort": {
+      "already_configured": "Ce mesh est déjà configuré",
+      "no_devices_found": "Aucun appareil mesh AwoX dans ce compte"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+pytest-homeassistant-custom-component>=0.13.375
+pycryptodome>=3.20  # legacy code used by the parity tests only
+aiousbwatcher
+serialx
+bluetooth-auto-recovery
+dbus-fast
+ruff>=0.17
+mypy>=2.0

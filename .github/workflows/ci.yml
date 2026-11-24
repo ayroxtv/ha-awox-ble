@@ -1,0 +1,18 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install -r requirements_test.txt
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: mypy custom_components tests
+      - run: MYPYPATH=custom_components/awox_ble mypy tools/awox_cli.py
+      - run: pytest -q
