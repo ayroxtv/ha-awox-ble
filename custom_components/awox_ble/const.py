@@ -20,6 +20,18 @@ RECONNECT_BACKOFF_MIN: Final = 0.5
 RECONNECT_BACKOFF_MAX: Final = 60.0
 CONNECT_MAX_ATTEMPTS: Final = 2
 LOGIN_TIMEOUT: Final = 10.0
+LOGIN_STEP_TIMEOUT: Final = 5.0
+NOTIFY_SETUP_TIMEOUT: Final = 35.0  # BlueZ ATT timeout is 30 s
+# BlueZ path (bluez#2383): cycle the link before BlueZ's 30 s ATT timeout does.
+NOTIFY_CYCLE: Final = 27.0
+NOTIFY_READY_DELAY: Final = 0.1
+RECONNECT_PLANNED_DELAY: Final = 0.05
+
+# What to do on a local (BlueZ) adapter, where notifications cost a link reset
+# every ~30 s on these nodes. ESPHome proxies always get stable push updates.
+CONF_BLUEZ_MODE: Final = "bluez_mode"
+BLUEZ_MODE_STABLE: Final = "stable"  # stable link, no push updates
+BLUEZ_MODE_CYCLE: Final = "cycle"  # push updates, link cycled every ~27 s
 KEEPALIVE_INTERVAL: Final = 60.0
 KEEPALIVE_TIMEOUT: Final = 10.0
 DISCONNECT_TIMEOUT: Final = 5.0
@@ -31,10 +43,12 @@ IDLE_WAIT_FOR_ADVERTISEMENT: Final = 30.0
 UNAVAILABLE_GRACE: Final = 30.0
 
 # Command queue.
-COMMAND_TTL: Final = 10.0  # drop commands that could not be sent in time
+COMMAND_TTL: Final = 30.0  # drop commands that could not be sent in time
 COMMAND_MIN_GAP: Final = 0.05  # Telink nodes drop packets when flooded
 COMMAND_WRITE_TIMEOUT: Final = 5.0
-COMMAND_WRITE_WITH_RESPONSE: Final = True
+# Write without response: faster, and never queued behind a pending ATT request
+# (the command characteristic supports it on AwoX / EGLO nodes).
+COMMAND_WRITE_WITH_RESPONSE: Final[bool | None] = False
 
 REDACT_KEYS: Final = {CONF_MESH_NAME, CONF_MESH_PASSWORD, CONF_MESH_KEY, "unique_id", "title"}
 

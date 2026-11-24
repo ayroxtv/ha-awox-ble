@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 from bleak.backends.device import BLEDevice
-from bleak.exc import BleakError
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 
 from custom_components.awox_ble.protocol import crypto
 from custom_components.awox_ble.protocol.constants import (
@@ -51,6 +52,47 @@ class FakeLight:
         )
 
 
+STATUS_HANDLE = 18
+
+
+class FakeServices(list[Any]):
+    """Empty GATT table that still resolves the status characteristic."""
+
+    def get_characteristic(self, uuid: str) -> Any:
+        if uuid == STATUS_CHAR_UUID:
+            return SimpleNamespace(uuid=uuid, handle=STATUS_HANDLE)
+        return None
+
+
+class FakeESPHomeAPI:
+    """The bits of aioesphomeapi.APIClient used by the raw notify path."""
+
+    def __init__(self, client: FakeMeshClient) -> None:
+        self._mesh_client = client
+        self.subscribed: list[tuple[int, int]] = []
+        self.fail = False
+
+    async def bluetooth_gatt_start_notify(
+        self, address: int, handle: int, on_notify: Callable[[int, bytes], None], timeout: float
+    ) -> tuple[Callable[[], Any], Callable[[], None]]:
+        if self.fail:
+            raise RuntimeError("proxy said no")
+        self.subscribed.append((address, handle))
+        self._mesh_client._notify_cb = lambda _char, data: on_notify(handle, bytes(data))
+
+        async def _stop() -> None:
+            return None
+
+        return _stop, lambda: None
+
+
+class ESPHomeClient:  # same class name as bleak_esphome's backend
+    def __init__(self, client: FakeMeshClient) -> None:
+        self._client = FakeESPHomeAPI(client)
+        self._address_as_int = int(client.mac.replace(":", ""), 16)
+        self._notify_cancels: dict[int, Any] = {}
+
+
 class FakeMeshClient:
     """Mimics the subset of BleakClient used by MeshManager."""
 
@@ -80,6 +122,11 @@ class FakeMeshClient:
         self.fail_writes = False
         self.notify_delay = notify_delay
         self._seq = 0
+        self.services = FakeServices()
+        self.missing_pair_char = False
+        self.cache_cleared = False
+        self.hang_start_notify = False
+        self.start_notify_calls = 0
 
     # -- BleakClient API -------------------------------------------------
 
@@ -87,9 +134,15 @@ class FakeMeshClient:
     def is_connected(self) -> bool:
         return self.connected
 
+    async def clear_cache(self) -> bool:
+        self.cache_cleared = True
+        return True
+
     async def write_gatt_char(self, char: str, data: bytes, response: bool | None = None) -> None:
         if not self.connected or self.fail_writes:
             raise BleakError("not connected")
+        if char == PAIR_CHAR_UUID and self.missing_pair_char:
+            raise BleakCharacteristicNotFoundError(char)
         data = bytes(data)
         self.written.append((char, data))
         if char == PAIR_CHAR_UUID and data[0] == PairOpcode.LOGIN_REQUEST:
@@ -119,7 +172,11 @@ class FakeMeshClient:
 
     async def start_notify(self, char: str, cb: Callable[[Any, bytearray], None]) -> None:
         assert char == STATUS_CHAR_UUID
+        self.start_notify_calls += 1
         self._notify_cb = cb
+        if self.hang_start_notify:
+            # Real EPanel over BlueZ: the CCCD write is never acknowledged.
+            await asyncio.Event().wait()
 
     async def disconnect(self) -> bool:
         self.connected = False
@@ -158,15 +215,19 @@ class FakeMeshClient:
             else:
                 self.emit_online_status(light)
 
-    def _emit(self, src: int, opcode: int, body: bytes) -> None:
-        if not self.notifications_enabled or self._notify_cb is None or self.session_key is None:
-            return
+    def _packet(self, src: int, opcode: int, body: bytes) -> bytes:
+        assert self.session_key is not None
         self._seq += 1
         header = self._seq.to_bytes(3, "little") + src.to_bytes(2, "little")
         nonce = crypto.mac_to_reversed_bytes(self.mac)[0:3] + header
         payload = (bytes([opcode]) + b"\x60\x01" + body).ljust(13, b"\x00")
         check = crypto.make_checksum(self.session_key, nonce, payload)
-        packet = header + check[0:2] + crypto.crypt_payload(self.session_key, nonce, payload)
+        return header + check[0:2] + crypto.crypt_payload(self.session_key, nonce, payload)
+
+    def _emit(self, src: int, opcode: int, body: bytes) -> None:
+        if not self.notifications_enabled or self._notify_cb is None or self.session_key is None:
+            return
+        packet = self._packet(src, opcode, body)
         cb = self._notify_cb
         loop = asyncio.get_running_loop()
         if self.notify_delay:
@@ -185,3 +246,21 @@ class FakeMeshClient:
 
 def ble_device(mac: str) -> BLEDevice:
     return BLEDevice(mac, "EPanel", {"path": "/org/bluez/hci0"})
+
+
+def make_esphome(client: FakeMeshClient) -> ESPHomeClient:
+    """Attach a fake ESPHome backend; plain start_notify then hangs (no CCCD)."""
+    backend = ESPHomeClient(client)
+    client._backend = backend  # type: ignore[attr-defined]
+    client.hang_start_notify = True
+    return backend
+
+
+class BleakClientBlueZDBus:  # same class name as bleak's BlueZ backend
+    pass
+
+
+def make_bluez(client: FakeMeshClient) -> None:
+    """Local adapter behaviour: plain start_notify never completes (bluez#2383)."""
+    client._backend = BleakClientBlueZDBus()  # type: ignore[attr-defined]
+    client.hang_start_notify = True

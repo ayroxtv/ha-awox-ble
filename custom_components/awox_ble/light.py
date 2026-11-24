@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from homeassistant.components.light import LightEntity
 from homeassistant.components.light.const import (
     ATTR_BRIGHTNESS,
+    ATTR_COLOR_MODE,
     ATTR_COLOR_TEMP_KELVIN,
     ATTR_RGB_COLOR,
     ColorMode,
 )
+from homeassistant.const import STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import AwoxConfigEntry
 from .const import CONF_DEVICES, DOMAIN, MANUFACTURER
@@ -58,7 +62,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class AwoxLight(LightEntity):
+class AwoxLight(LightEntity, RestoreEntity):
     _attr_has_entity_name = True
     _attr_name = None
     _attr_should_poll = False
@@ -105,6 +109,25 @@ class AwoxLight(LightEntity):
         )
         if (status := self._coordinator.statuses.get(self._mesh_id)) is not None:
             self._apply_status(status)
+        elif (last := await self.async_get_last_state()) is not None:
+            self._restore(last.state, last.attributes)
+
+    @callback
+    def _restore(self, state: str, attrs: Mapping[str, Any]) -> None:
+        """Start from the last known state (no push updates on a local adapter)."""
+        if state not in (STATE_ON, STATE_OFF):
+            return
+        self._attr_is_on = state == STATE_ON
+        modes = self.supported_color_modes or set()
+        mode = attrs.get(ATTR_COLOR_MODE)
+        if mode in modes:
+            self._attr_color_mode = ColorMode(mode)
+        if (brightness := attrs.get(ATTR_BRIGHTNESS)) is not None:
+            self._attr_brightness = int(brightness)
+        if (kelvin := attrs.get(ATTR_COLOR_TEMP_KELVIN)) is not None:
+            self._attr_color_temp_kelvin = int(kelvin)
+        if (rgb := attrs.get(ATTR_RGB_COLOR)) is not None and len(rgb) == 3:
+            self._attr_rgb_color = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
     @callback
     def _handle_update(self) -> None:

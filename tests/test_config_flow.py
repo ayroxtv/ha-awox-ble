@@ -201,3 +201,17 @@ async def test_bluetooth_discovery_of_known_node_aborts(hass: HomeAssistant) -> 
     )
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+
+
+async def test_options_flow_sets_bluez_mode(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id="abc", data={"devices": []})
+    entry.add_to_hass(hass)
+    with patch("custom_components.awox_ble.async_setup_entry", return_value=True):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        assert result["type"] is FlowResultType.FORM
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"bluez_mode": "cycle"}
+        )
+        await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == {"bluez_mode": "cycle"}

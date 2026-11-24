@@ -21,6 +21,18 @@ C'est une réécriture de [`fsaris/home-assistant-awox`](https://github.com/fsar
 - Keepalive : une lecture GATT légère après 60 s sans trafic détecte les connexions mortes.
 - Aucun appel bloquant, aucun thread, aucun sous-processus.
 
+### Adaptateur local ou proxy ESPHome
+
+Ces lumières n'ont pas de descripteur CCCD, et la pile Bluetooth locale de HA (BlueZ) coupe la liaison au bout de 30 s quand on active les notifications ([bluez/bluez#2383](https://github.com/bluez/bluez/issues/2383), voir `docs/PROTOCOL.md`).
+
+| Chemin | Comportement |
+|---|---|
+| Proxy Bluetooth ESPHome | Liaison stable **et** état poussé en temps réel (abonnement direct sur le proxy). Recommandé : un ESP32 à quelques euros suffit. |
+| Adaptateur local, mode **stable** (défaut) | Liaison stable, commandes immédiates. Pas de remontée d'état : HA garde l'état qu'il a envoyé (et le dernier état connu après redémarrage). Un changement fait depuis l'appli AwoX ou une télécommande n'est pas vu. |
+| Adaptateur local, mode **cycles** | L'état remonte, mais la liaison est relancée toutes les ~27 s ; le panneau mettant parfois ~20 s à se réannoncer, une commande peut attendre jusqu'à ~25 s. |
+
+Le mode se choisit dans *Paramètres → Appareils et services → AwoX / EGLO connect → Configurer*.
+
 ## Installation
 
 HACS (dépôt personnalisé, catégorie *Integration*) ou copie manuelle de `custom_components/awox_ble` dans `/config/custom_components/`.

@@ -46,7 +46,15 @@ Changement de mesh (appareil en usine `unpaired` / `1234`) : écrire successivem
 
 ## 4. Activation des notifications
 
-Après le login : s'abonner à **Status** (`…1911`) puis y écrire `01`. Sur l'ancien backend `gatttool`, le CCCD est la même poignée que la valeur ; avec bleak on fait `start_notify` **et** on écrit `01` sur la valeur (c'est ce qui déclenche l'envoi côté Telink).
+Après le login, écrire `01` sur la **valeur** de **Status** (`…1911`) : c'est ce qui déclenche l'envoi des notifications côté Telink.
+
+**Il n'y a pas de CCCD.** Mesuré sur un EGLO EPanel_120 : `…1911` (handle 17, propriétés read/write/notify) n'a qu'un descripteur `0x2901`. Conséquences :
+
+- `gatttool` (ancienne intégration) lit l'ATT brut et reçoit toutes les notifications sans rien écrire d'autre ; c'est pour ça que l'ancien code écrivait sur la poignée de valeur au lieu du CCCD.
+- **BlueZ** (adaptateur local de HA) synthétise un CCCD à l'emplacement du `0x2901` et y écrit lors de `StartNotify` / `AcquireNotify`. Le nœud ne répond jamais ; au bout du délai ATT de 30 s, BlueZ coupe la liaison (`UNLIKELY_ERROR`). Les notifications arrivent pendant ces 30 s. Voir [bluez/bluez#2383](https://github.com/bluez/bluez/issues/2383), fermé sans correctif.
+- **Proxy ESPHome** : `bluetooth_gatt_start_notify` s'abonne sur l'ESP sans écrire de CCCD ; c'est bleak-esphome qui l'écrit ensuite. On appelle donc l'API du proxy directement. Voir [bleak-esphome#447](https://github.com/Bluetooth-Devices/bleak-esphome/issues/447).
+- Lire `…1911` ne renvoie qu'un octet : impossible d'obtenir l'état par lecture.
+- Après une déconnexion, le nœud cesse parfois d'émettre ses annonces pendant ~20 s.
 
 ## 5. Commandes (client → mesh)
 

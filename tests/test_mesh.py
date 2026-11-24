@@ -19,7 +19,7 @@ from custom_components.awox_ble.protocol.constants import COMMAND_CHAR_UUID, STA
 from custom_components.awox_ble.protocol.packets import power_data
 
 from .conftest import MAC_1, MAC_2, FakeBluetooth
-from .fake_device import MESH_NAME, MESH_PASSWORD
+from .fake_device import MESH_NAME, MESH_PASSWORD, STATUS_HANDLE, make_bluez, make_esphome
 
 
 class Recorder:
@@ -236,10 +236,11 @@ async def test_stale_commands_are_dropped(hass: HomeAssistant, fake_bt: FakeBlue
         on_status=rec.on_status,
         on_connection_change=rec.on_connection,
     )
-    with patch.object(mesh_mod, "COMMAND_TTL", 0.1):
+    # TTL above the ~0.1 s notification arming delay, below the time out of range.
+    with patch.object(mesh_mod, "COMMAND_TTL", 0.3):
         mgr.async_send(1, Opcode.POWER, power_data(True))
         mgr.async_start(lambda coro, name: hass.async_create_background_task(coro, name))
-        await asyncio.sleep(0.2)  # the command ages while no node is in range
+        await asyncio.sleep(0.5)  # the command ages while no node is in range
         fake_bt.in_range[MAC_1] = (-50, "hci0")
         mgr._wake.set()
         try:
@@ -278,3 +279,218 @@ async def test_stop_cancels_cleanly(manager: tuple[MeshManager, Recorder], fake_
     assert not mgr.connected
     assert not fake_bt.clients[0].connected
     assert (COMMAND_CHAR_UUID, b"") not in fake_bt.clients[0].written
+
+
+async def test_missing_characteristic_clears_cache_and_retries(
+    hass: HomeAssistant, fake_bt: FakeBluetooth
+) -> None:
+    """Partial GATT discovery (seen on the real EPanel): clear cache, reconnect."""
+    original = fake_bt.establish_connection
+    first: list[bool] = []
+
+    async def flaky(*args: Any, **kwargs: Any) -> Any:
+        client = await original(*args, **kwargs)
+        if not first:
+            first.append(True)
+            client.missing_pair_char = True
+        return client
+
+    rec = Recorder()
+    with patch("custom_components.awox_ble.mesh.establish_connection", side_effect=flaky):
+        mgr = MeshManager(
+            hass,
+            mesh_name=MESH_NAME,
+            mesh_password=MESH_PASSWORD,
+            node_macs=[MAC_1],
+            on_status=rec.on_status,
+            on_connection_change=rec.on_connection,
+        )
+        mgr.async_start(lambda coro, name: hass.async_create_background_task(coro, name))
+        try:
+            await rec.wait_for(lambda: mgr.connected, timeout=5)
+        finally:
+            await mgr.async_stop()
+    assert fake_bt.clients[0].cache_cleared
+    assert len(fake_bt.clients) == 2
+
+
+async def test_hanging_start_notify_does_not_block_session(
+    hass: HomeAssistant, fake_bt: FakeBluetooth
+) -> None:
+    """EPanel behaviour: StartNotify never returns, notifications still flow."""
+    fake_bt.client_kwargs["notify_delay"] = 0.0
+    original = fake_bt.establish_connection
+
+    async def hanging(*args: Any, **kwargs: Any) -> Any:
+        client = await original(*args, **kwargs)
+        client.hang_start_notify = True
+        return client
+
+    rec = Recorder()
+    with patch("custom_components.awox_ble.mesh.establish_connection", side_effect=hanging):
+        mgr = MeshManager(
+            hass,
+            mesh_name=MESH_NAME,
+            mesh_password=MESH_PASSWORD,
+            node_macs=[MAC_1],
+            on_status=rec.on_status,
+            on_connection_change=rec.on_connection,
+        )
+        mgr.async_start(lambda coro, name: hass.async_create_background_task(coro, name))
+        try:
+            await rec.wait_for(lambda: {s.mesh_id for s in rec.statuses} == {1, 2})
+            mgr.async_send(1, Opcode.POWER, power_data(True))
+            await rec.wait_for(lambda: any(s.mesh_id == 1 and s.state for s in rec.statuses))
+            assert mgr.connected
+            assert len(fake_bt.clients) == 1
+        finally:
+            await mgr.async_stop()
+
+
+def _manager(hass: HomeAssistant, rec: Recorder, bluez_mode: str = "stable") -> MeshManager:
+    mgr = MeshManager(
+        hass,
+        mesh_name=MESH_NAME,
+        mesh_password=MESH_PASSWORD,
+        node_macs=[MAC_1],
+        on_status=rec.on_status,
+        on_connection_change=rec.on_connection,
+        bluez_mode=bluez_mode,
+    )
+    mgr.async_start(lambda coro, name: hass.async_create_background_task(coro, name))
+    return mgr
+
+
+async def test_bluez_planned_cycle_keeps_commands(
+    hass: HomeAssistant, fake_bt: FakeBluetooth, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Local adapter: start_notify never completes, we cycle the link before BlueZ."""
+    original = fake_bt.establish_connection
+
+    async def hanging(*args: Any, **kwargs: Any) -> Any:
+        client = await original(*args, **kwargs)
+        client.hang_start_notify = True
+        return client
+
+    rec = Recorder()
+    caplog.set_level("INFO")
+    with (
+        patch("custom_components.awox_ble.mesh.establish_connection", side_effect=hanging),
+        patch.object(mesh_mod, "NOTIFY_CYCLE", 0.3),
+    ):
+        mgr = _manager(hass, rec)
+        try:
+            await rec.wait_for(lambda: mgr.stats.planned_cycles >= 2, timeout=5)
+            assert mgr.notify_mode in ("pending", "bluez-cycle", "none")
+            # a command issued at any time is delivered, never lost
+            mgr.async_send(1, Opcode.POWER, power_data(True))
+            await rec.wait_for(lambda: fake_bt.lights[1].on, timeout=5)
+            await rec.wait_for(lambda: mgr.stats.planned_cycles >= 3, timeout=5)
+            assert all(c.commands for c in fake_bt.clients[:2])  # status request each time
+        finally:
+            await mgr.async_stop()
+    # cycles are routine: no INFO noise after the first connection
+    info = [r.message for r in caplog.records if r.levelname == "INFO" and "awox" in r.name]
+    assert sum("connected to mesh" in m for m in info) == 1
+    assert not any("lost" in m for m in info)
+    assert mgr.stats.auth_failures == 0
+
+
+async def test_esphome_proxy_raw_notify(hass: HomeAssistant, fake_bt: FakeBluetooth) -> None:
+    """Proxy path: subscribe on the proxy, never call the CCCD-writing start_notify."""
+    original = fake_bt.establish_connection
+    backends: list[Any] = []
+
+    async def via_proxy(*args: Any, **kwargs: Any) -> Any:
+        client = await original(*args, **kwargs)
+        backends.append(make_esphome(client))
+        return client
+
+    rec = Recorder()
+    with (
+        patch("custom_components.awox_ble.mesh.establish_connection", side_effect=via_proxy),
+        patch.object(mesh_mod, "NOTIFY_CYCLE", 0.3),
+    ):
+        mgr = _manager(hass, rec)
+        try:
+            await rec.wait_for(lambda: {s.mesh_id for s in rec.statuses} == {1, 2})
+            assert mgr.notify_mode == "esphome-raw"
+            mgr.async_send(2, Opcode.POWER, power_data(True))
+            await rec.wait_for(lambda: any(s.mesh_id == 2 and s.state for s in rec.statuses))
+            await asyncio.sleep(0.5)  # longer than the BlueZ cycle: must not cycle here
+            assert mgr.stats.planned_cycles == 0
+            assert len(fake_bt.clients) == 1
+            assert fake_bt.clients[0].start_notify_calls == 0
+            assert backends[0]._client.subscribed == [(0xA4C138123456, STATUS_HANDLE)]
+            assert STATUS_HANDLE in backends[0]._notify_cancels
+        finally:
+            await mgr.async_stop()
+
+
+async def test_esphome_raw_failure_falls_back(hass: HomeAssistant, fake_bt: FakeBluetooth) -> None:
+    original = fake_bt.establish_connection
+
+    async def via_broken_proxy(*args: Any, **kwargs: Any) -> Any:
+        client = await original(*args, **kwargs)
+        make_esphome(client)._client.fail = True
+        client.hang_start_notify = False
+        return client
+
+    rec = Recorder()
+    with patch(
+        "custom_components.awox_ble.mesh.establish_connection", side_effect=via_broken_proxy
+    ):
+        mgr = _manager(hass, rec)
+        try:
+            await rec.wait_for(lambda: {s.mesh_id for s in rec.statuses} == {1, 2})
+            assert mgr.notify_mode == "standard"
+            assert fake_bt.clients[0].start_notify_calls == 1
+        finally:
+            await mgr.async_stop()
+
+
+def _patch_backend(fake_bt: FakeBluetooth, setup: Callable[[Any], None]) -> Any:
+    original = fake_bt.establish_connection
+
+    async def connect(*args: Any, **kwargs: Any) -> Any:
+        client = await original(*args, **kwargs)
+        setup(client)
+        return client
+
+    return patch("custom_components.awox_ble.mesh.establish_connection", side_effect=connect)
+
+
+async def test_bluez_stable_mode_never_touches_notify(
+    hass: HomeAssistant, fake_bt: FakeBluetooth
+) -> None:
+    """Local adapter, default mode: no StartNotify, so the link is never reset."""
+    rec = Recorder()
+    with _patch_backend(fake_bt, make_bluez), patch.object(mesh_mod, "NOTIFY_CYCLE", 0.2):
+        mgr = _manager(hass, rec)
+        try:
+            await rec.wait_for(lambda: mgr.connected)
+            mgr.async_send(1, Opcode.POWER, power_data(True))
+            # no status comes back in this mode: poll the fake device instead
+            async with asyncio.timeout(3):
+                while not fake_bt.lights[1].on:
+                    await asyncio.sleep(0.01)
+            await asyncio.sleep(0.6)  # several times the (patched) cycle period
+            assert mgr.notify_mode == "none"
+            assert mgr.stats.planned_cycles == 0
+            assert len(fake_bt.clients) == 1
+            assert fake_bt.clients[0].start_notify_calls == 0
+            assert rec.connection == [True]
+        finally:
+            await mgr.async_stop()
+
+
+async def test_bluez_cycle_mode_opt_in(hass: HomeAssistant, fake_bt: FakeBluetooth) -> None:
+    rec = Recorder()
+    with _patch_backend(fake_bt, make_bluez), patch.object(mesh_mod, "NOTIFY_CYCLE", 0.3):
+        mgr = _manager(hass, rec, bluez_mode="cycle")
+        try:
+            await rec.wait_for(lambda: {s.mesh_id for s in rec.statuses} == {1, 2})
+            await rec.wait_for(lambda: mgr.stats.planned_cycles >= 1, timeout=5)
+            assert fake_bt.clients[0].start_notify_calls == 1
+        finally:
+            await mgr.async_stop()

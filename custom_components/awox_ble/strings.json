@@ -45,5 +45,24 @@
       "already_configured": "This mesh is already configured",
       "no_devices_found": "No AwoX mesh device in this account"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Local Bluetooth adapter",
+        "description": "These lights break Home Assistant's local Bluetooth stack (BlueZ) when notifications are enabled. ESPHome Bluetooth proxies are not affected and always get instant state updates.",
+        "data": {
+          "bluez_mode": "Behaviour on a local adapter"
+        }
+      }
+    }
+  },
+  "selector": {
+    "bluez_mode": {
+      "options": {
+        "stable": "Stable link: instant commands, no updates for changes made in the AwoX app",
+        "cycle": "Push updates: changes from the app show up, but the link restarts every ~27 s (commands can wait up to ~25 s)"
+      }
+    }
   }
 }

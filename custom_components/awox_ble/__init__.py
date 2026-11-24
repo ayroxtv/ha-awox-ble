@@ -8,7 +8,15 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant
 
-from .const import CONF_DEVICES, CONF_GATEWAY_MACS, CONF_MESH_NAME, CONF_MESH_PASSWORD, DOMAIN
+from .const import (
+    BLUEZ_MODE_STABLE,
+    CONF_BLUEZ_MODE,
+    CONF_DEVICES,
+    CONF_GATEWAY_MACS,
+    CONF_MESH_NAME,
+    CONF_MESH_PASSWORD,
+    DOMAIN,
+)
 from .coordinator import AwoxMeshCoordinator
 from .mesh import MeshManager
 
@@ -41,8 +49,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: AwoxConfigEntry) -> bool
         on_status=coordinator.async_handle_status,
         on_connection_change=coordinator.async_handle_connection,
         label=label,
+        bluez_mode=entry.options.get(CONF_BLUEZ_MODE, BLUEZ_MODE_STABLE),
     )
     coordinator.mesh = mesh
+    coordinator.async_start_grace()
     entry.runtime_data = AwoxRuntimeData(coordinator=coordinator, mesh=mesh)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

@@ -11,7 +11,7 @@ import pytest
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, State
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry, mock_restore_cache
 
 from custom_components.awox_ble.const import DOMAIN, mesh_unique_id
 from custom_components.awox_ble.diagnostics import async_get_config_entry_diagnostics
@@ -161,3 +161,56 @@ async def test_unload(hass: HomeAssistant, entry: MockConfigEntry, fake_bt: Fake
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.NOT_LOADED
     assert not fake_bt.clients[0].connected
+
+
+ENTRY_DATA = {
+    "mesh_name": MESH_NAME,
+    "mesh_password": MESH_PASSWORD,
+    "mesh_key": "ltk",
+    "devices": [
+        {
+            "mesh_id": 1,
+            "name": "Salon",
+            "mac": MAC_1,
+            "type": ".ble.tlmesh.light.dimming.temperature.color",
+        }
+    ],
+    "gateway_macs": [],
+}
+
+
+async def test_restores_last_state_and_queues_early_commands(
+    hass: HomeAssistant, fake_bt: FakeBluetooth
+) -> None:
+    """Local adapter, stable mode: no push, so start from the last known state."""
+    mock_restore_cache(
+        hass,
+        [
+            State(
+                ENTITY,
+                STATE_ON,
+                {"color_mode": "color_temp", "brightness": 77, "color_temp_kelvin": 3500},
+            )
+        ],
+    )
+    fake_bt.in_range.clear()  # node not reachable yet
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=mesh_unique_id(MESH_NAME), data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    state = _state(hass)
+    assert state.state == STATE_ON
+    assert state.attributes["brightness"] == 77
+    assert state.attributes["color_temp_kelvin"] == 3500
+
+    # Available (grace period) although not connected: the command is queued...
+    await hass.services.async_call("light", "turn_off", {"entity_id": ENTITY}, blocking=True)
+    assert _state(hass).state == STATE_OFF
+    assert not entry.runtime_data.mesh.connected
+    # ...and sent as soon as the node shows up.
+    fake_fresh = fake_bt.lights[1]
+    fake_fresh.on = True
+    fake_bt.in_range[MAC_1] = (-60, "hci0")
+    entry.runtime_data.mesh._wake.set()
+    await _wait(lambda: not fake_fresh.on)

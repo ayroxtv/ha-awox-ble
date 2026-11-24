@@ -13,14 +13,14 @@ import contextlib
 import logging
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
-from bleak.exc import BleakError
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     BleakOutOfConnectionSlotsError,
@@ -30,6 +30,7 @@ from homeassistant.components import bluetooth
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 
 from .const import (
+    BLUEZ_MODE_STABLE,
     COMMAND_MIN_GAP,
     COMMAND_TTL,
     COMMAND_WRITE_TIMEOUT,
@@ -39,11 +40,16 @@ from .const import (
     IDLE_WAIT_FOR_ADVERTISEMENT,
     KEEPALIVE_INTERVAL,
     KEEPALIVE_TIMEOUT,
+    LOGIN_STEP_TIMEOUT,
     LOGIN_TIMEOUT,
     NODE_AUTH_FAILURE_COOLDOWN,
     NODE_FAILURE_COOLDOWN,
+    NOTIFY_CYCLE,
+    NOTIFY_READY_DELAY,
+    NOTIFY_SETUP_TIMEOUT,
     RECONNECT_BACKOFF_MAX,
     RECONNECT_BACKOFF_MIN,
+    RECONNECT_PLANNED_DELAY,
 )
 from .protocol import DEST_ALL, LightStatus, LoginHandshake, MeshAuthError, MeshSession, Opcode
 from .protocol.constants import (
@@ -83,6 +89,7 @@ class MeshStats:
     commands_coalesced: int = 0
     notifications: int = 0
     bad_packets: int = 0
+    planned_cycles: int = 0
     last_connect_seconds: float | None = None
     last_reconnect_gap_seconds: float | None = None
     last_error: str | None = None
@@ -93,6 +100,15 @@ class MeshStats:
 
 class SessionEnded(Exception):
     """The current GATT session is over (disconnect, keepalive or write failure)."""
+
+
+class PlannedCycle(SessionEnded):
+    """BlueZ workaround: we end the link before BlueZ's 30 s ATT timeout does.
+
+    BlueZ writes a CCCD it synthesized (the node only has a 0x2901 descriptor,
+    bluez/bluez#2383); the node never answers, BlueZ tears the link down after
+    30 s. Notifications flow meanwhile, so we reconnect on our own schedule.
+    """
 
 
 class MeshManager:
@@ -108,11 +124,13 @@ class MeshManager:
         on_status: StatusCallback,
         on_connection_change: ConnectionCallback,
         label: str = "awox",
+        bluez_mode: str = BLUEZ_MODE_STABLE,
     ) -> None:
         self._hass = hass
         self._mesh_name = mesh_name.encode()
         self._mesh_password = mesh_password.encode()
         self._label = label
+        self._bluez_mode = bluez_mode
         self._on_status = on_status
         self._on_connection_change = on_connection_change
         self._known_macs: set[str] = {m.upper() for m in node_macs if m}
@@ -120,6 +138,16 @@ class MeshManager:
         # Soft penalty (ranked last) after a failure; hard ban after an auth failure.
         self._node_penalty_until: dict[str, float] = {}
         self._node_banned_until: dict[str, float] = {}
+        self._gatt_logged: set[str] = set()
+        self._notify_pending = False
+        self._notify_ready = asyncio.Event()
+        self._write_hold = False
+        self._write_lock = asyncio.Lock()
+        self._planned_end = False
+        self._last_end_planned = False
+        self.notify_mode = "none"
+        self._connected_at = 0.0
+        self._first_notification_logged = False
 
         self._queue: deque[QueuedCommand] = deque()
         self._queue_event = asyncio.Event()
@@ -261,6 +289,11 @@ class MeshManager:
                     await self._async_session(mac, device, rssi, source)
                 except asyncio.CancelledError:
                     raise
+                except PlannedCycle as err:
+                    self.stats.planned_cycles += 1
+                    _LOGGER.debug("[%s] planned reconnect: %s", self._label, err)
+                    backoff = RECONNECT_PLANNED_DELAY
+                    break
                 except MeshAuthError:
                     self.stats.auth_failures += 1
                     self.stats.last_error = "mesh credentials refused"
@@ -302,11 +335,16 @@ class MeshManager:
 
             if self._stopping.is_set():
                 return
-            _LOGGER.debug("[%s] reconnecting in %.1f s", self._label, backoff)
+            if backoff > RECONNECT_PLANNED_DELAY:
+                _LOGGER.debug("[%s] reconnecting in %.1f s", self._label, backoff)
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(backoff):
                     await self._stopping.wait()
-            backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
+            backoff = (
+                RECONNECT_BACKOFF_MIN
+                if backoff <= RECONNECT_PLANNED_DELAY
+                else min(backoff * 2, RECONNECT_BACKOFF_MAX)
+            )
 
     def _session_was_useful(self, started: float) -> bool:
         """A session that logged in counts as success for the backoff."""
@@ -334,10 +372,31 @@ class MeshManager:
         )
         self._client = client
         try:
-            async with asyncio.timeout(LOGIN_TIMEOUT):
+            _LOGGER.debug(
+                "[%s] BLE link to %s up in %.0f ms",
+                self._label,
+                mac,
+                (time.monotonic() - t0) * 1000,
+            )
+            self._log_gatt_table(client, mac)
+            try:
                 session = await self._async_login(client, mac)
-                await client.start_notify(STATUS_CHAR_UUID, self._on_notify)
-                await client.write_gatt_char(STATUS_CHAR_UUID, ENABLE_NOTIFICATIONS, response=True)
+                # Telink enables notifications on a write of 01 to the status *value*
+                # (legacy pygatt and the ESPHome hub never write the CCCD). Do it first,
+                # while no ATT request is pending.
+                await self._step(
+                    "enable notifications",
+                    client.write_gatt_char(STATUS_CHAR_UUID, ENABLE_NOTIFICATIONS, response=None),
+                )
+            except BleakCharacteristicNotFoundError:
+                # Stale or partial service discovery: drop the cache so the next
+                # connection rediscovers the GATT table.
+                clear_cache = getattr(client, "clear_cache", None)
+                if clear_cache is not None:
+                    _LOGGER.debug("[%s] characteristic missing, clearing GATT cache", self._label)
+                    with contextlib.suppress(BleakError, TimeoutError, OSError):
+                        await clear_cache()
+                raise
             elapsed = time.monotonic() - t0
             self.stats.connections += 1
             self.stats.last_connect_seconds = round(elapsed, 3)
@@ -350,20 +409,26 @@ class MeshManager:
             self.gateway_source = source
             self._last_activity = time.monotonic()
             self._node_penalty_until.pop(mac, None)
-            _LOGGER.info(
+            _LOGGER.log(
+                logging.DEBUG if self._last_end_planned else logging.INFO,
                 "[%s] connected to mesh through %s via %s in %.2f s",
                 self._label,
                 mac,
                 source,
                 elapsed,
             )
+            self._planned_end = False
             self._on_connection_change(True)
             # The only "poll": one status request right after connecting.
             self._queue.appendleft(
                 QueuedCommand(DEST_ALL, Opcode.REQUEST_STATUS, request_status_data())
             )
             self._queue_event.set()
-            await self._async_serve(client, session, disconnected)
+            try:
+                await self._async_serve(client, session, disconnected, mac)
+            except PlannedCycle:
+                self._planned_end = True
+                raise
         finally:
             was_connected = self._session is not None
             self._session = None
@@ -373,7 +438,14 @@ class MeshManager:
             if was_connected:
                 self.stats.disconnections += 1
                 self._disconnected_at = time.monotonic()
-                _LOGGER.info("[%s] mesh link through %s lost", self._label, mac)
+                self._last_end_planned = self._planned_end
+                _LOGGER.log(
+                    logging.DEBUG if self._planned_end else logging.INFO,
+                    "[%s] mesh link through %s %s",
+                    self._label,
+                    mac,
+                    "cycled" if self._planned_end else "lost",
+                )
                 self._on_connection_change(False)
             with contextlib.suppress(BleakError, TimeoutError, OSError):
                 async with asyncio.timeout(DISCONNECT_TIMEOUT):
@@ -381,14 +453,173 @@ class MeshManager:
 
     async def _async_login(self, client: BleakClient, mac: str) -> MeshSession:
         handshake = LoginHandshake(self._mesh_name, self._mesh_password)
-        await client.write_gatt_char(PAIR_CHAR_UUID, handshake.request(), response=True)
-        reply = await client.read_gatt_char(PAIR_CHAR_UUID)
+        await self._step(
+            "pair write",
+            client.write_gatt_char(PAIR_CHAR_UUID, handshake.request(), response=None),
+        )
+        reply = await self._step("pair read", client.read_gatt_char(PAIR_CHAR_UUID))
+        _LOGGER.debug(
+            "[%s] pair reply opcode 0x%02x (%d bytes)",
+            self._label,
+            reply[0] if reply else -1,
+            len(reply),
+        )
         return MeshSession(handshake.complete(bytes(reply)), mac)
 
+    async def _step[T](self, name: str, awaitable: Awaitable[T]) -> T:
+        """Run one GATT step with its own timeout and a timing log."""
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(LOGIN_STEP_TIMEOUT):
+                result = await awaitable
+        except TimeoutError as err:
+            raise SessionEnded(f"{name} timed out after {LOGIN_STEP_TIMEOUT:.0f} s") from err
+        _LOGGER.debug(
+            "[%s] %s ok in %.0f ms", self._label, name, (time.monotonic() - started) * 1000
+        )
+        return result
+
+    def _log_gatt_table(self, client: BleakClient, mac: str) -> None:
+        """Log the GATT layout once per node (debug only)."""
+        if mac in self._gatt_logged or not _LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        self._gatt_logged.add(mac)
+        for service in client.services:
+            for char in service.characteristics:
+                _LOGGER.debug(
+                    "[%s] gatt %s: service %s char %s handle %d props %s descriptors %s",
+                    self._label,
+                    mac,
+                    service.uuid,
+                    char.uuid,
+                    char.handle,
+                    ",".join(char.properties),
+                    ",".join(d.uuid for d in char.descriptors) or "-",
+                )
+
+    async def _async_start_notify(self, client: BleakClient, mac: str) -> None:
+        """Arm notifications with the strategy that suits the connection path.
+
+        * ESPHome proxy: subscribe on the proxy only (no CCCD write, the node has
+          no CCCD), see Bluetooth-Devices/bleak-esphome#447.
+        * Anything else (BlueZ): standard start_notify in the background. If it
+          does not complete, BlueZ is stuck on its synthesized CCCD (bluez#2383):
+          notifications still flow, and we cycle the link before BlueZ drops it.
+        """
+        backend = getattr(client, "_backend", None)
+        if type(backend).__name__ == "ESPHomeClient" and await self._async_esphome_raw_notify(
+            client, backend, mac
+        ):
+            self.notify_mode = "esphome-raw"
+            self._notify_ready.set()
+            await asyncio.Event().wait()
+
+        if (
+            type(backend).__name__ == "BleakClientBlueZDBus"
+            and self._bluez_mode == BLUEZ_MODE_STABLE
+        ):
+            # Local adapter, stable mode: never trigger BlueZ's CCCD write (bluez#2383),
+            # the link then stays up indefinitely. No push updates in this mode, and
+            # reading the status value only returns 1 byte on these nodes, so the
+            # entities keep their restored / optimistic state.
+            self.notify_mode = "none"
+            self._notify_ready.set()
+            await asyncio.Event().wait()
+
+        started = time.monotonic()
+        self._notify_pending = True
+        self.notify_mode = "pending"
+        notify = asyncio.ensure_future(client.start_notify(STATUS_CHAR_UUID, self._on_notify))
+        try:
+            # bleak registers the callback before the D-Bus call goes out.
+            await asyncio.sleep(NOTIFY_READY_DELAY)
+            self._notify_ready.set()
+            done, _ = await asyncio.wait({notify}, timeout=NOTIFY_CYCLE - NOTIFY_READY_DELAY)
+            if notify in done:
+                self._notify_pending = False
+                if (exc := notify.exception()) is None:
+                    self.notify_mode = "standard"
+                    _LOGGER.debug(
+                        "[%s] start_notify on %s ok in %.0f ms",
+                        self._label,
+                        mac,
+                        (time.monotonic() - started) * 1000,
+                    )
+                else:
+                    self.notify_mode = "none"
+                    _LOGGER.warning(
+                        "[%s] notifications unavailable through %s (%s: %s): commands "
+                        "work, state changes made elsewhere will not show up",
+                        self._label,
+                        mac,
+                        type(exc).__name__,
+                        exc,
+                    )
+                await asyncio.Event().wait()
+            self.notify_mode = "bluez-cycle"
+            await self._async_hold_writes()
+            raise PlannedCycle(
+                f"start_notify still pending after {NOTIFY_CYCLE:.0f} s (bluez#2383)"
+            )
+        finally:
+            self._notify_pending = False
+            if not notify.done():
+                notify.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await notify
+
+    async def _async_esphome_raw_notify(
+        self, client: BleakClient, backend: object, mac: str
+    ) -> bool:
+        """Subscribe on the ESPHome proxy without the CCCD write.
+
+        Uses private attributes of bleak-esphome's ESPHomeClient; any surprise
+        falls back to the standard path.
+        """
+        try:
+            api: Any = getattr(backend, "_client")  # noqa: B009
+            address: int = getattr(backend, "_address_as_int")  # noqa: B009
+            cancels: dict[int, Any] = getattr(backend, "_notify_cancels")  # noqa: B009
+            char = client.services.get_characteristic(STATUS_CHAR_UUID)
+            if char is None:
+                return False
+            handle = char.handle
+            if handle not in cancels:
+
+                def _raw(_handle: int, data: bytes | bytearray) -> None:
+                    self._on_notify(char, bytearray(data))
+
+                cancels[handle] = await api.bluetooth_gatt_start_notify(
+                    address, handle, _raw, NOTIFY_SETUP_TIMEOUT
+                )
+        except Exception as err:
+            _LOGGER.debug(
+                "[%s] ESPHome raw notify on %s unavailable (%s: %s), using start_notify",
+                self._label,
+                mac,
+                type(err).__name__,
+                err,
+            )
+            return False
+        _LOGGER.debug("[%s] notifications through ESPHome proxy (raw) on %s", self._label, mac)
+        return True
+
+    async def _async_hold_writes(self) -> None:
+        """Stop sending commands and wait for the write in flight, if any."""
+        self._write_hold = True
+        async with self._write_lock:
+            pass
+
     async def _async_serve(
-        self, client: BleakClient, session: MeshSession, disconnected: asyncio.Event
+        self, client: BleakClient, session: MeshSession, disconnected: asyncio.Event, mac: str
     ) -> None:
+        self._connected_at = time.monotonic()
+        self._first_notification_logged = False
+        self._notify_ready.clear()
+        self._write_hold = False
+        self.notify_mode = "none"
         tasks = [
+            asyncio.create_task(self._async_start_notify(client, mac), name="awox notify"),
             asyncio.create_task(self._async_writer(client, session), name="awox writer"),
             asyncio.create_task(self._async_keepalive(client), name="awox keepalive"),
             asyncio.create_task(disconnected.wait(), name="awox disconnected"),
@@ -404,11 +635,19 @@ class MeshManager:
             if not task.cancelled() and (exc := task.exception()) is not None:
                 raise exc
         if disconnected.is_set():
+            if self.notify_mode == "pending":
+                # BlueZ beat our timer to it: same expected cycle.
+                raise PlannedCycle("BlueZ ATT timeout on the synthesized CCCD")
             raise SessionEnded("device disconnected")
 
     async def _async_writer(self, client: BleakClient, session: MeshSession) -> None:
         last_write = 0.0
+        # Do not send the status request before the notification path is armed.
+        async with asyncio.timeout(NOTIFY_SETUP_TIMEOUT):
+            await self._notify_ready.wait()
         while True:
+            if self._write_hold:
+                await asyncio.Event().wait()  # session is about to be cycled
             if not self._queue:
                 self._queue_event.clear()
                 await self._queue_event.wait()
@@ -422,16 +661,19 @@ class MeshManager:
             gap = COMMAND_MIN_GAP - (time.monotonic() - last_write)
             if gap > 0:
                 await asyncio.sleep(gap)
-            packet = session.encode(cmd.dest, cmd.opcode, cmd.data)
-            t_write = time.monotonic()
-            try:
-                async with asyncio.timeout(COMMAND_WRITE_TIMEOUT):
-                    await client.write_gatt_char(
-                        COMMAND_CHAR_UUID, packet, response=COMMAND_WRITE_WITH_RESPONSE
-                    )
-            except (BleakError, TimeoutError) as err:
-                # Keep the command queued: it is resent after reconnection if still fresh.
-                raise SessionEnded(f"command write failed: {err}") from err
+            async with self._write_lock:
+                if self._write_hold:
+                    continue
+                packet = session.encode(cmd.dest, cmd.opcode, cmd.data)
+                t_write = time.monotonic()
+                try:
+                    async with asyncio.timeout(COMMAND_WRITE_TIMEOUT):
+                        await client.write_gatt_char(
+                            COMMAND_CHAR_UUID, packet, response=COMMAND_WRITE_WITH_RESPONSE
+                        )
+                except (BleakError, TimeoutError) as err:
+                    # Keep the command queued: resent after reconnection if still fresh.
+                    raise SessionEnded(f"command write failed: {err}") from err
             if self._queue and self._queue[0] is cmd:
                 self._queue.popleft()
             last_write = self._last_activity = time.monotonic()
@@ -449,6 +691,10 @@ class MeshManager:
         """Detect zombie links: a cheap GATT read when the link has been idle."""
         while True:
             idle = time.monotonic() - self._last_activity
+            if self._notify_pending:
+                # A read would queue behind the pending CCCD write: skip this round.
+                await asyncio.sleep(KEEPALIVE_INTERVAL)
+                continue
             if idle < KEEPALIVE_INTERVAL:
                 await asyncio.sleep(KEEPALIVE_INTERVAL - idle)
                 continue
@@ -471,6 +717,13 @@ class MeshManager:
             _LOGGER.debug("[%s] dropped notification with bad checksum", self._label)
             return
         self.stats.notifications += 1
+        if not self._first_notification_logged:
+            self._first_notification_logged = True
+            _LOGGER.debug(
+                "[%s] first notification %.0f ms after the session started",
+                self._label,
+                (time.monotonic() - self._connected_at) * 1000,
+            )
         status = parse_status(clear)
         if status is None:
             _LOGGER.debug(
@@ -499,6 +752,7 @@ class MeshManager:
             "known_macs": sorted(self._known_macs),
             "seen_macs": sorted(self._seen_macs),
             "queued_commands": len(self._queue),
+            "notify_mode": self.notify_mode,
             "nodes_penalized": sorted(
                 mac for mac, until in self._node_penalty_until.items() if until > time.monotonic()
             ),
@@ -531,7 +785,7 @@ async def async_probe_mesh(
     try:
         async with asyncio.timeout(LOGIN_TIMEOUT):
             handshake = LoginHandshake(mesh_name.encode(), mesh_password.encode())
-            await client.write_gatt_char(PAIR_CHAR_UUID, handshake.request(), response=True)
+            await client.write_gatt_char(PAIR_CHAR_UUID, handshake.request(), response=None)
             reply = await client.read_gatt_char(PAIR_CHAR_UUID)
             session = MeshSession(handshake.complete(bytes(reply)), mac.upper())
 
@@ -541,11 +795,11 @@ async def async_probe_mesh(
                     mesh_ids.add(status.mesh_id)
 
             await client.start_notify(STATUS_CHAR_UUID, _collect)
-            await client.write_gatt_char(STATUS_CHAR_UUID, ENABLE_NOTIFICATIONS, response=True)
+            await client.write_gatt_char(STATUS_CHAR_UUID, ENABLE_NOTIFICATIONS, response=None)
             await client.write_gatt_char(
                 COMMAND_CHAR_UUID,
                 session.encode(DEST_ALL, Opcode.REQUEST_STATUS, request_status_data()),
-                response=True,
+                response=None,
             )
         await asyncio.sleep(listen)
     finally:

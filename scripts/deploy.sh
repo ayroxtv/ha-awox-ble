@@ -9,13 +9,23 @@ HOST="${HA_SSH:?set HA_SSH, e.g. root@homeassistant.local}"
 PORT="${HA_SSH_PORT:-22}"
 cd "$(dirname "$0")/.."
 
-tar -C custom_components --exclude '__pycache__' -czf - awox_ble \
-  | ssh -p "$PORT" "$HOST" 'mkdir -p /config/custom_components \
-      && rm -rf /config/custom_components/awox_ble \
-      && tar -xzf - -C /config/custom_components \
-      && echo "deployed: $(grep "\"version\"" /config/custom_components/awox_ble/manifest.json)"'
+# COPYFILE_DISABLE: no macOS AppleDouble (._*) files. Writes need root: the add-on
+# user (e.g. hassio) is in wheel and has passwordless sudo; root logins skip sudo.
+SUDO='sudo -n'
+[[ "$HOST" == root@* ]] && SUDO=''
+COPYFILE_DISABLE=1 tar -C custom_components --exclude '__pycache__' --exclude '._*' -czf - awox_ble \
+  | ssh -p "$PORT" "$HOST" "$SUDO mkdir -p /config/custom_components \
+      && $SUDO rm -rf /config/custom_components/awox_ble \
+      && $SUDO tar -xzf - -C /config/custom_components --no-same-owner \
+      && grep '\"version\"' /config/custom_components/awox_ble/manifest.json"
+echo "deployed to $HOST:/config/custom_components/awox_ble"
 
 if [[ "${1:-}" != "--no-restart" ]]; then
-  ssh -p "$PORT" "$HOST" 'ha core restart'
-  echo "Home Assistant Core restart requested"
+  # The `ha` CLI needs the Supervisor token, which non-interactive SSH sessions
+  # of the add-on may not have. Fall back to a manual restart in that case.
+  if ssh -p "$PORT" "$HOST" "ha core restart"; then
+    echo "Home Assistant Core restart requested"
+  else
+    echo "Could not restart from SSH: restart HA from the UI (or the homeassistant.restart action)." >&2
+  fi
 fi

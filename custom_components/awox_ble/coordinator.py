@@ -27,7 +27,9 @@ class AwoxMeshCoordinator:
         self.hass = hass
         self.label = label
         self.statuses: dict[int, LightStatus] = {}
-        self.available = False
+        # Optimistically available at start: commands sent while the first
+        # connection is being made are queued instead of being refused by HA.
+        self.available = True
         self._listeners: dict[int, list[Callable[[], None]]] = {}
         self._cancel_grace: CALLBACK_TYPE | None = None
         self._shutdown = False
@@ -87,6 +89,12 @@ class AwoxMeshCoordinator:
         _LOGGER.info("[%s] mesh unreachable for %.0f s", self.label, UNAVAILABLE_GRACE)
         self.available = False
         self._notify()
+
+    @callback
+    def async_start_grace(self) -> None:
+        """Go unavailable if no connection is made within the grace period."""
+        if self._cancel_grace is None and not (self.mesh is not None and self.mesh.connected):
+            self._cancel_grace = async_call_later(self.hass, UNAVAILABLE_GRACE, self._grace_expired)
 
     @callback
     def async_shutdown(self) -> None:

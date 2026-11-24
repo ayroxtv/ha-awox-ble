@@ -45,5 +45,24 @@
       "already_configured": "Ce mesh est déjà configuré",
       "no_devices_found": "Aucun appareil mesh AwoX dans ce compte"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Adaptateur Bluetooth local",
+        "description": "Avec la pile Bluetooth locale de Home Assistant (BlueZ), activer les notifications de ces lumières fait tomber la liaison. Les proxys Bluetooth ESPHome ne sont pas concernés et reçoivent toujours l'état en temps réel.",
+        "data": {
+          "bluez_mode": "Comportement sur un adaptateur local"
+        }
+      }
+    }
+  },
+  "selector": {
+    "bluez_mode": {
+      "options": {
+        "stable": "Liaison stable : commandes immédiates, mais les changements faits depuis l'appli AwoX ne remontent pas",
+        "cycle": "Mises à jour poussées : les changements faits depuis l'appli remontent, mais la liaison redémarre toutes les ~27 s (une commande peut attendre jusqu'à ~25 s)"
+      }
+    }
   }
 }

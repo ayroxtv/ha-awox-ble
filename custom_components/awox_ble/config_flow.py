@@ -8,12 +8,26 @@ from typing import Any
 import probatio as vol
 from bleak.exc import BleakError
 from homeassistant.components import bluetooth
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_MAC, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .cloud import AwoxCloud, CloudAuthError, CloudError
 from .const import (
+    BLUEZ_MODE_CYCLE,
+    BLUEZ_MODE_STABLE,
+    CONF_BLUEZ_MODE,
     CONF_DEVICES,
     CONF_GATEWAY_MACS,
     CONF_MESH_KEY,
@@ -40,6 +54,11 @@ def _normalize_mac(value: str) -> str:
 
 class AwoxBleConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> AwoxBleOptionsFlow:
+        return AwoxBleOptionsFlow()
 
     def __init__(self) -> None:
         self._discovered_mac: str | None = None
@@ -188,4 +207,27 @@ class AwoxBleConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+        )
+
+
+class AwoxBleOptionsFlow(OptionsFlowWithReload):
+    """How to behave on a local (BlueZ) adapter; the entry reloads on save."""
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+        current = self.config_entry.options.get(CONF_BLUEZ_MODE, BLUEZ_MODE_STABLE)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_BLUEZ_MODE, default=current): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[BLUEZ_MODE_STABLE, BLUEZ_MODE_CYCLE],
+                            mode=SelectSelectorMode.LIST,
+                            translation_key=CONF_BLUEZ_MODE,
+                        )
+                    )
+                }
+            ),
         )
